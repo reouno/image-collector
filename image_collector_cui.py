@@ -16,7 +16,7 @@ class Google(object):
             {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:10.0) Gecko/20100101 Firefox/10.0'})
 
     def search(self, keyword, maximum):
-        print('begin searching', keyword)
+        print('Begining searching', keyword)
         query = self.query_gen(keyword)
         return self.image_search(query, maximum)
 
@@ -46,7 +46,7 @@ class Google(object):
 
             # Add search result
             if not len(imageURLs):
-                print('-> no more images')
+                print('-> No more images')
                 break
             elif len(imageURLs) > maximum - total:
                 result += imageURLs[:maximum - total]
@@ -55,7 +55,7 @@ class Google(object):
                 result += imageURLs
                 total += len(imageURLs)
 
-        print('-> found', str(len(result)), 'images')
+        print('-> Found', str(len(result)), 'images')
         return result
 
 
