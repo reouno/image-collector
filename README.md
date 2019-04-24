@@ -17,7 +17,7 @@ The main use is to automatically collect data sets for machine learning.
 ```
 
 ## Requirement
-This code is written in `Python 3.6.6`.  
+This code is written in `Python 3.7.3`.  
 You can get the necessary libraries like below.  
 ```
 sudo apt-get install python3-tk
