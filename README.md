@@ -16,9 +16,6 @@ pip3 install -r requirements.txt
 
 ## Usage
 ```
-python3 image_collector.py
-```
-```
 # target name is one of query, directory path, or file path
 python3 image_collector_cui.py [target name] [download number] [save dir]
 ```
