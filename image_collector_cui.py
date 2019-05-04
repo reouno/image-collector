@@ -1,10 +1,60 @@
+import csv
+from datetime import datetime
+import glob
 import json
 import os
+import re
 import sys
+import time
 import urllib
 
 from bs4 import BeautifulSoup
 import requests
+from requests.exceptions import ConnectionError, ReadTimeout
+from typing import List
+
+def queries_from_other_sources(func):
+    '''decorator to edit sys.args and run func several times
+
+    If the query is file path:
+    The file should be simple text format and one query in one line.
+
+    If the query is directory path:
+    Assuming the dirctory names like "n02098105-soft-coated_wheaten_terrier".
+    For example, the above directory names are parsed to "soft-coated wheaten terrier"
+    with the following rules:
+    - if the first character is "n", the following 8 characters are numbers,
+      and the following character is "-", then remove all these 10 characters
+      and apply the following rules to the remaining characters.
+    - replace all the "_" with " " (space).
+
+    Otherwise:
+    just use the query to search with google
+    '''
+    def wrapper(*args, **kwargs):
+        if len(args[0]) != 4:
+            raise RuntimeError('Invalid argment\n> python3 ./image_collector_cui.py [target name] [download number] [save dir]')
+        if os.path.isfile(args[0][1]):
+            with open(args[0][1], 'r') as f:
+                queries = [q[:-1] for q in f.readlines()] # remove '\n' at the end of each string
+            dirnames = [q.replace(' ', '_') for q in queries]
+            args[0].append('')
+            for query, dirname in zip(queries, dirnames):
+                args[0][1] = query
+                args[0][4] = dirname
+                func(args[0], **kwargs)
+        elif os.path.isdir(os.path.split(args[0][1])[0]):
+            dirnames = [os.path.split(p)[1] for p in glob.glob(args[0][1])]
+            queries = [re.sub(r'^n\d{8}-', '', s.replace('_', ' ')) for s in dirnames]
+            args[0].append('')
+            for query, dirname in zip(queries, dirnames):
+                args[0][1] = query
+                args[0][4] = dirname
+                func(args[0], **kwargs)
+        else:
+            func(args[0], **kwargs)
+        return None
+    return wrapper
 
 
 class Google(object):
@@ -38,7 +88,18 @@ class Google(object):
         total = 0
         while True:
             # Search
-            html = self.session.get(next(query_gen)).text
+            query = next(query_gen)
+            try:
+                html = self.session.get(query, timeout=20).text
+            except (ConnectionError, ReadTimeout) as e:
+                print(e)
+                print('retry in 10 sec...')
+                time.sleep(10) # may need some time to escape connection refusion next time
+                try:
+                    html = self.session.get(query, timeout=20).text
+                except Exception as e:
+                    print(e)
+                    continue
             soup = BeautifulSoup(html, 'lxml')
             elements = soup.select('.rg_meta.notranslate')
             jsons = [json.loads(e.get_text()) for e in elements]
@@ -59,35 +120,67 @@ class Google(object):
         return result
 
 
-def main():
+@queries_from_other_sources
+def main(args: List):
+    '''download images by google search
+    :param args: should be sys.argv
+    '''
     google = Google()
-    if len(sys.argv) != 3:
+    req_headers = {"User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:47.0) Gecko/20100101 Firefox/47.0"}
+    if len(args) < 4:
         print('Invalid argment')
         print(
-            '> python3 ./image_collector_cui.py [target name] [download number]')
+            '> python3 ./image_collector_cui.py [target name] [download number] [save dir]')
         sys.exit()
     else:
         # Save location
-        name = sys.argv[1]
-        data_dir = 'data/'
-        os.makedirs(data_dir, exist_ok=True)
-        os.makedirs('data/' + name, exist_ok=True)
+        name = args[1]
+        data_dir = args[3]
+        if len(args) > 4:
+            dest_dir_path = os.path.join(data_dir, 'images', args[4])
+            urls_dest_dir_path = os.path.join(data_dir, 'urls')
+            urls_file = os.path.join(urls_dest_dir_path, args[4] + '.csv')
+        else:
+            dest_dir_path = os.path.join(data_dir, 'images', name.replace(' ', '_'))
+            urls_dest_dir_path = os.path.join(data_dir, 'urls')
+            urls_file = os.path.join(urls_dest_dir_path, name.replace(' ', '_') + '.csv')
+        os.makedirs(dest_dir_path, exist_ok=True)
+        os.makedirs(urls_dest_dir_path, exist_ok=True)
 
         # Search image
         result = google.search(
-            name, maximum=int(sys.argv[2]))
+            name, maximum=int(args[2]))
+        result_logs = []
 
         # Download
         download_error = []
         for i in range(len(result)):
             print('-> Downloading image', str(i + 1).zfill(4))
             try:
-                urllib.request.urlretrieve(
-                    result[i], data_dir + name + '/' + str(i + 1).zfill(4) + '.jpg')
-            except BaseException:
+                request = urllib.request.Request(url=result[i], headers=req_headers)
+                data = urllib.request.urlopen(request, timeout=15).read()
+                with open(os.path.join(dest_dir_path, str(i + 1).zfill(4) + '.jpg'), "wb") as f:
+                    f.write(data)
+                downloaded = 1
+            except requests.exceptions.ConnectionError as e:
                 print('--> Could not download image', str(i + 1).zfill(4))
+                print(e)
                 download_error.append(i + 1)
-                continue
+                downloaded = 0
+                time.sleep(10) # may need some time to escape connection refusion next time
+            except Exception as e:
+                print('--> Could not download image', str(i + 1).zfill(4))
+                print(e)
+                download_error.append(i + 1)
+                downloaded = 0
+
+            result_logs.append((i+1, result[i], downloaded))
+
+        # save logs
+        with open(urls_file, 'w') as f:
+            writer = csv.writer(f, lineterminator='\n')
+            writer.writerow(['No.', 'url', 'is_downloaded'])
+            writer.writerows(result_logs)
 
         print('Complete download')
         print('├─ Download', len(result) - len(download_error), 'images')
@@ -96,4 +189,4 @@ def main():
 
 
 if __name__ == '__main__':
-    main()
+    main(sys.argv)
