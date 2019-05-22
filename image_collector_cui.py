@@ -12,11 +12,36 @@ from bs4 import BeautifulSoup
 import requests
 from requests.exceptions import ConnectionError, ReadTimeout
 from typing import List
+from urllib.request import HTTPError, URLError
+
+def with_timestamp(func):
+    '''add prefix of timestamp to input text
+    '''
+    def wrapper(*args, **kwargs):
+        prefix = '[{}]:'.format(datetime.now())
+        #arg = ' '.join(str(args))
+        #arg = '[{}]: {}'.format(datetime.now(), arg)
+        args = [prefix] + list(args)
+        return func(*args, **kwargs)
+    return wrapper
+
+@with_timestamp
+def my_print(*args, **kwargs):
+    print(*args, **kwargs)
+
+def print_erro_with_trace(e):
+    '''print error contents with trace back
+    :param e: exception object
+    '''
+    # NOTE: seems not to show trace back
+    tb = sys.exc_info()[2]
+    my_print(e.with_traceback(tb))
 
 def queries_from_other_sources(func):
     '''decorator to edit sys.args and run func several times
 
     If the query is file path:
+    Assuming the file contains query texts.
     The file should be simple text format and one query in one line.
 
     If the query is directory path:
@@ -29,7 +54,7 @@ def queries_from_other_sources(func):
     - replace all the "_" with " " (space).
 
     Otherwise:
-    just use the query to search with google
+    just use the arg as query to search with google
     '''
     def wrapper(*args, **kwargs):
         if len(args[0]) != 4:
@@ -44,12 +69,25 @@ def queries_from_other_sources(func):
                 args[0][4] = dirname
                 func(args[0], **kwargs)
         elif os.path.isdir(os.path.split(args[0][1])[0]):
-            dirnames = [os.path.split(p)[1] for p in glob.glob(args[0][1])]
+
+            # retry download if the no. of images is less than this number.
+            min_num_enough_images = 400
+
+            dirpaths = [p for p in glob.glob(args[0][1]) if os.path.isdir(p)]
+            #my_print('dirpaths:',dirpaths)
+            dirnames = [os.path.split(p)[1] for p in dirpaths]
+            #my_print('dirnames:',dirnames)
             queries = [re.sub(r'^n\d{8}-', '', s.replace('_', ' ')) for s in dirnames]
             args[0].append('')
-            for query, dirname in zip(queries, dirnames):
+            for query, dirname, dirpath in zip(queries, dirnames, dirpaths):
+                num_images = len([f for f in glob.glob(os.path.join(dirpath, '*')) if os.path.isfile(f)])
+                my_print('The no. of images downloaded with "{}" of "{}": {}'.format(query, dirname, num_images))
+                if num_images >= min_num_enough_images:
+                    my_print('skip download')
+                    continue
                 args[0][1] = query
                 args[0][4] = dirname
+                my_print(args[0])
                 func(args[0], **kwargs)
         else:
             func(args[0], **kwargs)
@@ -66,7 +104,7 @@ class Google(object):
             {'User-Agent': 'Mozilla/5.0 (X11; Linux x86_64; rv:10.0) Gecko/20100101 Firefox/10.0'})
 
     def search(self, keyword, maximum):
-        print('Begining searching', keyword)
+        my_print('Begining searching', keyword)
         query = self.query_gen(keyword)
         return self.image_search(query, maximum)
 
@@ -82,6 +120,31 @@ class Google(object):
             yield self.GOOGLE_SEARCH_URL + '?' + params
             page += 1
 
+    def request_with_retry(self, query, timeout=20, max_try=2):
+        '''try to send search request and get html
+        :param query: request query
+        :param timeout: request timeout
+        :param max_try: max times of trying to request. 1 means no retry.
+        '''
+        html = None
+        # retry if the exception is ConnectionError or ReadTimeout
+        for i in range(max_try):
+            try:
+                html = self.session.get(query, timeout=timeout).text
+                break
+            except (ConnectionError, ReadTimeout) as e:
+                print('ConnectionError, ReadTimeout')
+                print_erro_with_trace(e)
+            except Exception as e:
+                print('Exception')
+                print_erro_with_trace(e)
+                break
+
+            my_print('retry in 30 sec...')
+            time.sleep(30) # may need some time to escape connection refusion next time
+
+        return html
+
     def image_search(self, query_gen, maximum):
         # Search image
         result = []
@@ -89,17 +152,11 @@ class Google(object):
         while True:
             # Search
             query = next(query_gen)
-            try:
-                html = self.session.get(query, timeout=20).text
-            except (ConnectionError, ReadTimeout) as e:
-                print(e)
-                print('retry in 10 sec...')
-                time.sleep(10) # may need some time to escape connection refusion next time
-                try:
-                    html = self.session.get(query, timeout=20).text
-                except Exception as e:
-                    print(e)
-                    continue
+            html = self.request_with_retry(query, timeout=20, max_try=2)
+            if html is None:
+                continue
+
+            # parse to find image url
             soup = BeautifulSoup(html, 'lxml')
             elements = soup.select('.rg_meta.notranslate')
             jsons = [json.loads(e.get_text()) for e in elements]
@@ -107,7 +164,7 @@ class Google(object):
 
             # Add search result
             if not len(imageURLs):
-                print('-> No more images')
+                my_print('-> No more images')
                 break
             elif len(imageURLs) > maximum - total:
                 result += imageURLs[:maximum - total]
@@ -116,20 +173,52 @@ class Google(object):
                 result += imageURLs
                 total += len(imageURLs)
 
-        print('-> Found', str(len(result)), 'images')
+        my_print('-> Found', str(len(result)), 'images')
         return result
 
+def download_img_with_retry(query, timeout=15, max_try=2):
+    '''try to download image from web URL
+    :param query: request query
+    :param timeout: request timeout
+    :param max_try: max times of trying to request. 1 means no retry.
+    '''
+    data = None
+    # retry if the exception is ConnectionError or URLError
+    for i in range(max_try):
+        try:
+            data = urllib.request.urlopen(query, timeout=15).read()
+            break
+        except HTTPError as e:
+            print('HTTPError')
+            # must be caught before URLError because HTTPError is
+            # sub class of URLError.
+            print_erro_with_trace(e)
+            break
+        except (ConnectionError, URLError) as e:
+            print('ConnectionError, URLError')
+            print_erro_with_trace(e)
+        except Exception as e:
+            print('Exception')
+            print_erro_with_trace(e)
+            break
+
+        my_print('retry in 30 sec...')
+        time.sleep(30) # may need some time to escape connection refusion next time
+
+    return data
 
 @queries_from_other_sources
 def main(args: List):
     '''download images by google search
     :param args: should be sys.argv
+
+    TODO: should use argparse to parse command line arguments.
     '''
     google = Google()
     req_headers = {"User-Agent": "Mozilla/5.0 (X11; Ubuntu; Linux x86_64; rv:47.0) Gecko/20100101 Firefox/47.0"}
     if len(args) < 4:
-        print('Invalid argment')
-        print(
+        my_print('Invalid argment')
+        my_print(
             '> python3 ./image_collector_cui.py [target name] [download number] [save dir]')
         sys.exit()
     else:
@@ -155,24 +244,18 @@ def main(args: List):
         # Download
         download_error = []
         for i in range(len(result)):
-            print('-> Downloading image', str(i + 1).zfill(4))
-            try:
-                request = urllib.request.Request(url=result[i], headers=req_headers)
-                data = urllib.request.urlopen(request, timeout=15).read()
+            my_print('-> Downloading image', str(i + 1).zfill(4))
+
+            query = urllib.request.Request(url=result[i], headers=req_headers)
+            image_data = download_img_with_retry(query, timeout=15, max_try=2)
+            if image_data is None:
+                my_print('--> Could not download image with error', str(i + 1).zfill(4))
+                download_error.append(i + 1)
+                downloaded = 0
+            else:
                 with open(os.path.join(dest_dir_path, str(i + 1).zfill(4) + '.jpg'), "wb") as f:
-                    f.write(data)
+                    f.write(image_data)
                 downloaded = 1
-            except requests.exceptions.ConnectionError as e:
-                print('--> Could not download image', str(i + 1).zfill(4))
-                print(e)
-                download_error.append(i + 1)
-                downloaded = 0
-                time.sleep(10) # may need some time to escape connection refusion next time
-            except Exception as e:
-                print('--> Could not download image', str(i + 1).zfill(4))
-                print(e)
-                download_error.append(i + 1)
-                downloaded = 0
 
             result_logs.append((i+1, result[i], downloaded))
 
@@ -182,9 +265,9 @@ def main(args: List):
             writer.writerow(['No.', 'url', 'is_downloaded'])
             writer.writerows(result_logs)
 
-        print('Complete download')
-        print('├─ Download', len(result) - len(download_error), 'images')
-        print('└─ Could not download', len(
+        my_print('Complete download')
+        my_print('├─ Download', len(result) - len(download_error), 'images')
+        my_print('└─ Could not download', len(
             download_error), 'images', download_error)
 
 
